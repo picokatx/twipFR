@@ -9,23 +9,48 @@ from path import findContours, find_subpaths, disjoint_path_join, reverse_draw_c
 from path import draw_path, draw_paths, find_subpaths, addEdgeToGroup, reverse_draw_commands, findContours, disjoint_path_join, crop_path, get_disjoint, closed
 class FLADocument:
     def __init__(self, path: str) -> None:
-        self.root  = ET.parse(path).getroot() # BASE_DIR+"PonyTemplate►3Q Front Wing.xml"
+        self.root  = ET.parse(path).getroot()
         layers = xml_find_prepend(self.root, ["timeline", "DOMTimeline", "layers"])
         anim_frames = {}
-        # add option to split layers into separate animations because of wings
         for layer in reversed(layers):
             frames = xml_findall_prepend(layer, ["frames/"])
             for i, frame in enumerate(frames):
                 index = int(frame.attrib["index"])
                 if index not in anim_frames: anim_frames[index] = []
-                elements = xml_findall_prepend(frame, ["elements/"])
-                for element in elements:
-                    if element.tag=="{http://ns.adobe.com/xfl/2008/}DOMShape":
-                        anim_frames[index].append(self.DOMshape_parse(element))
-                    if element.tag=="{http://ns.adobe.com/xfl/2008/}DOMGroup":
-                        for member in xml_findall_prepend(element, ["DOMShape"]):
-                            anim_frames[index].append(self.DOMshape_parse(member))
+                anim_frames[index].extend(self.DOMgroup_parse(frame))
         self.animations = [v for k,v in sorted(anim_frames.items())]
+
+
+    def DOMSymbolInstance_parse(self, elm: Element):
+        libraryItemName = elm.attrib["libraryItemName"]
+        matrix = xml_find_prepend(elm, ["matrix/"])
+        transformation_matrix = None
+        if matrix!=None:
+            matargs = matrix.attrib
+            a = matargs['a'] if 'a' in matargs else 1
+            b = matargs['b'] if 'b' in matargs else 0
+            c = matargs['c'] if 'c' in matargs else 0
+            d = matargs['d'] if 'd' in matargs else 1
+            tx = matargs['tx'] if 'tx' in matargs else 0
+            ty = matargs['ty'] if 'ty' in matargs else 0
+
+            transformation_matrix = np.array([
+                [a, c, tx],
+                [b, d, ty],
+                [0, 0, 1]
+            ], dtype=np.float64)
+    
+    def DOMgroup_parse(self, elm: Element, ):
+        elements = xml_findall_prepend(elm, ["elements/" if elm.tag=="{http://ns.adobe.com/xfl/2008/}DOMFrame" else "members/"])
+        ret = []
+        for element in elements:
+            if element.tag=="{http://ns.adobe.com/xfl/2008/}DOMShape":
+                ret.append(self.DOMshape_parse(element))
+            if element.tag=="{http://ns.adobe.com/xfl/2008/}DOMGroup":
+                ret.extend(self.DOMgroup_parse(element))
+            if element.tag=="{http://ns.adobe.com/xfl/2008/}DOMSymbolInstance":
+                ret.append(self.DOMSymbolInstance_parse(element))
+        return ret
 
     def transform_point(x, y, matrix):
         point = np.array([x, y, 1])
@@ -133,11 +158,11 @@ class FLADocument:
             for path in split_paths:
                 if path.fill0 != None: addEdgeToGroup(edgeGroups, path.fill0,  path)
                 if path.fill1 != None: addEdgeToGroup(edgeGroups, path.fill1, reverse_draw_commands(path))
+            
             filledRegs = {}
             for fillStyle, group in edgeGroups.items():
                 filledRegs[fillStyle] = findContours(group, fillStyle)
-
-
+            
             for fillStyle, group in filledRegs.items():
                 # need to merge fills down to single path
                 a = findContours([path for path in group], fillStyle)
@@ -146,21 +171,36 @@ class FLADocument:
                     ret = disjoint_path_join(ret, a[i])
                 filledRegs[fillStyle] = [ret]
 
+            transform = None
+            if type(shape.trans_mat)==np.ndarray:
+                tm = shape.trans_mat
+                tm_a = tm[0][0]
+                tm_b = tm[1][0]
+                tm_c = tm[0][1]
+                tm_d = tm[1][1]
+                tm_tx = tm[0][2]
+                tm_ty = tm[1][2]
+                transform = f"matrix({tm_a} {tm_b} {tm_c} {tm_d} {tm_tx} {tm_ty})"
+
             for fillStyle, contours in filledRegs.items():
                 for contour in contours:
-                    transform = None
-                    if type(shape.trans_mat)==np.ndarray:
-                        tm = shape.trans_mat
-                        tm_a = tm[0][0]
-                        tm_b = tm[1][0]
-                        tm_c = tm[0][1]
-                        tm_d = tm[1][1]
-                        tm_tx = tm[0][2]
-                        tm_ty = tm[1][2]
-                        transform = f"matrix({tm_a} {tm_b} {tm_c} {tm_d} {tm_tx} {tm_ty})"
                     stroke = contour.stroke if contour.stroke!=None else StrokeStyle(None, None, None, 0, None, None)
                     tracer = dw.Path(fill=fillStyle.color, opacity=fillStyle.alpha, stroke=stroke.color, stroke_width=stroke.weight, stroke_linecap="butt", stroke_linejoin=stroke.joints, stroke_miterlimit=stroke.miterLimit, transform=transform)
                     for edge in contour.edges:
+                        if edge.type==DrawCommand.MOVETO:
+                            tracer.M(edge.data[0], edge.data[1])
+                        if edge.type==DrawCommand.LINETO:
+                            tracer.L(edge.data[0], edge.data[1])
+                        if edge.type==DrawCommand.QUADRATICTO:
+                            tracer.Q(edge.data[0], edge.data[1], edge.data[2], edge.data[3])
+                    d.append(tracer)
+                    
+            # handle stroke only paths seperately
+            for path in split_paths:
+                if path.fill0 == None and path.fill1 == None and path.stroke!=None:
+                    stroke = path.stroke
+                    tracer = dw.Path(opacity=fillStyle.alpha, stroke=stroke.color, stroke_width=stroke.weight, stroke_linecap="butt", stroke_linejoin=stroke.joints, stroke_miterlimit=stroke.miterLimit, transform=transform)
+                    for edge in path.edges:
                         if edge.type==DrawCommand.MOVETO:
                             tracer.M(edge.data[0], edge.data[1])
                         if edge.type==DrawCommand.LINETO:
